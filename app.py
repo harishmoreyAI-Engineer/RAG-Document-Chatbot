@@ -5,10 +5,8 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
 
-# ── Page Config ──────────────────────────────────────────────────────────────
+# ── Page Config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="DocBot — Ask Your PDF",
     page_icon="📄",
@@ -19,7 +17,6 @@ st.set_page_config(
 st.markdown("""
 <style>
     .main { background-color: #f8fafc; }
-    .stTextInput > div > div > input { border-radius: 10px; }
     .answer-box {
         background: #eff6ff;
         border-left: 4px solid #2563eb;
@@ -43,7 +40,7 @@ st.markdown("""
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/4/4b/PDF_file_icon.svg/267px-PDF_file_icon.svg.png", width=60)
-    st.title("DocBot Settings")
+    st.title("DocBot")
     st.markdown("---")
     openai_key = st.secrets.get("OPENAI_API_KEY", "")
     if not openai_key:
@@ -58,7 +55,7 @@ with st.sidebar:
 
 # ── Main UI ───────────────────────────────────────────────────────────────────
 st.title("📄 DocBot — Ask Your PDF")
-st.markdown("Upload any PDF document and ask questions in plain English. The AI answers **only from your document** — no hallucination.")
+st.markdown("Upload any PDF and ask questions. The AI answers **only from your document**.")
 
 uploaded_file = st.file_uploader(
     "📂 Upload a PDF file",
@@ -67,18 +64,21 @@ uploaded_file = st.file_uploader(
 )
 
 # ── Session State ─────────────────────────────────────────────────────────────
-if "qa_chain" not in st.session_state:
-    st.session_state.qa_chain = None
+if "retriever" not in st.session_state:
+    st.session_state.retriever = None
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "doc_name" not in st.session_state:
     st.session_state.doc_name = None
+if "page_count" not in st.session_state:
+    st.session_state.page_count = 0
+if "chunk_count" not in st.session_state:
+    st.session_state.chunk_count = 0
 
 # ── Process PDF ───────────────────────────────────────────────────────────────
 if uploaded_file and openai_key:
     if st.session_state.doc_name != uploaded_file.name:
-
-        with st.spinner("📖 Reading and indexing your document... (this takes ~15 seconds)"):
+        with st.spinner("📖 Reading and indexing your document... (~15 seconds)"):
             try:
                 os.environ["OPENAI_API_KEY"] = openai_key
 
@@ -99,55 +99,30 @@ if uploaded_file and openai_key:
                 )
                 chunks = splitter.split_documents(pages)
 
-                # Embed and store in ChromaDB
+                # Embed into ChromaDB
                 embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
                 vectorstore = Chroma.from_documents(chunks, embeddings)
-                retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
-                # Custom prompt — answers only from document
-                prompt_template = """You are a helpful assistant that answers questions strictly based on the provided document context.
-If the answer is not in the document, say: "I couldn't find this information in the uploaded document."
-Always be concise and clear.
-
-Context from document:
-{context}
-
-Question: {question}
-
-Answer:"""
-
-                PROMPT = PromptTemplate(
-                    template=prompt_template,
-                    input_variables=["context", "question"]
-                )
-
-                # Build QA chain
-                llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-                st.session_state.qa_chain = RetrievalQA.from_chain_type(
-                    llm=llm,
-                    chain_type="stuff",
-                    retriever=retriever,
-                    return_source_documents=True,
-                    chain_type_kwargs={"prompt": PROMPT}
-                )
-
+                st.session_state.retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
                 st.session_state.doc_name = uploaded_file.name
                 st.session_state.chat_history = []
+                st.session_state.page_count = len(pages)
+                st.session_state.chunk_count = len(chunks)
 
-                st.success(f"✅ **{uploaded_file.name}** indexed successfully! {len(pages)} pages · {len(chunks)} chunks ready.")
+                st.success(f"✅ **{uploaded_file.name}** ready! {len(pages)} pages · {len(chunks)} chunks indexed.")
 
             except Exception as e:
-                st.error(f"❌ Error processing PDF: {str(e)}")
+                st.error(f"❌ Error: {str(e)}")
                 st.info("Make sure your OpenAI API key is correct and has available credits.")
 
 elif uploaded_file and not openai_key:
-    st.warning("⚠️ API key not found. Please add it in Streamlit Cloud Secrets settings.")
+    st.warning("⚠️ API key not found. Add it in Streamlit Cloud → Settings → Secrets.")
 
 elif not uploaded_file:
     st.info("👆 Upload a PDF above to get started.")
 
-# ── Chat Interface ─────────────────────────────────────────────────────────────
-if st.session_state.qa_chain:
+# ── Chat Interface ────────────────────────────────────────────────────────────
+if st.session_state.retriever:
     st.markdown("---")
     st.markdown(f"### 💬 Ask about: `{st.session_state.doc_name}`")
 
@@ -158,8 +133,10 @@ if st.session_state.qa_chain:
         if item.get("sources"):
             with st.expander("📎 Source pages used"):
                 for src in item["sources"]:
-                    page_num = src.metadata.get("page", "?") + 1
-                    snippet = src.page_content[:200].replace("\n", " ")
+                    page_num = src.metadata.get("page", "?")
+                    if isinstance(page_num, int):
+                        page_num += 1
+                    snippet = src.page_content[:250].replace("\n", " ")
                     st.markdown(f'<div class="source-box">📄 Page {page_num}: "{snippet}..."</div>', unsafe_allow_html=True)
         st.markdown("---")
 
@@ -167,13 +144,13 @@ if st.session_state.qa_chain:
     with st.form(key="question_form", clear_on_submit=True):
         question = st.text_input(
             "Ask a question:",
-            placeholder="e.g. What are the main services offered? / Summarize this document / What is the pricing?",
+            placeholder="e.g. Summarize this document / What are the main services? / What is the pricing?"
         )
-        col1, col2 = st.columns([1, 5])
+        col1, col2 = st.columns([1, 4])
         with col1:
             submit = st.form_submit_button("Ask →", use_container_width=True)
         with col2:
-            clear = st.form_submit_button("🗑️ Clear Chat", use_container_width=False)
+            clear = st.form_submit_button("🗑️ Clear Chat")
 
     if clear:
         st.session_state.chat_history = []
@@ -182,14 +159,37 @@ if st.session_state.qa_chain:
     if submit and question:
         with st.spinner("🤔 Thinking..."):
             try:
-                result = st.session_state.qa_chain({"query": question})
-                answer = result["result"]
-                sources = result.get("source_documents", [])
+                os.environ["OPENAI_API_KEY"] = openai_key
+
+                # Retrieve relevant chunks
+                docs = st.session_state.retriever.invoke(question)
+                context = "\n\n".join([doc.page_content for doc in docs])
+
+                # Build prompt manually
+                system_prompt = """You are a helpful assistant that answers questions strictly based on the provided document context.
+If the answer is not found in the context, say: "I couldn't find this information in the uploaded document."
+Always be concise and clear."""
+
+                user_message = f"""Context from document:
+{context}
+
+Question: {question}
+
+Answer:"""
+
+                # Call OpenAI directly
+                llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+                from langchain_core.messages import SystemMessage, HumanMessage
+                response = llm.invoke([
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=user_message)
+                ])
+                answer = response.content
 
                 st.session_state.chat_history.append({
                     "question": question,
                     "answer": answer,
-                    "sources": sources
+                    "sources": docs
                 })
                 st.rerun()
 
