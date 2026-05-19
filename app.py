@@ -4,7 +4,8 @@ import os
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.vectorstores import Chroma
+from langchain_community.vectorstores import FAISS
+from langchain_core.messages import SystemMessage, HumanMessage
 
 # ── Page Config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -16,7 +17,6 @@ st.set_page_config(
 # ── Custom CSS ────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-    .main { background-color: #f8fafc; }
     .answer-box {
         background: #eff6ff;
         border-left: 4px solid #2563eb;
@@ -70,10 +70,6 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "doc_name" not in st.session_state:
     st.session_state.doc_name = None
-if "page_count" not in st.session_state:
-    st.session_state.page_count = 0
-if "chunk_count" not in st.session_state:
-    st.session_state.chunk_count = 0
 
 # ── Process PDF ───────────────────────────────────────────────────────────────
 if uploaded_file and openai_key:
@@ -82,16 +78,13 @@ if uploaded_file and openai_key:
             try:
                 os.environ["OPENAI_API_KEY"] = openai_key
 
-                # Save to temp file
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
                     f.write(uploaded_file.read())
                     tmp_path = f.name
 
-                # Load PDF
                 loader = PyPDFLoader(tmp_path)
                 pages = loader.load()
 
-                # Split into chunks
                 splitter = RecursiveCharacterTextSplitter(
                     chunk_size=600,
                     chunk_overlap=80,
@@ -99,25 +92,21 @@ if uploaded_file and openai_key:
                 )
                 chunks = splitter.split_documents(pages)
 
-                # Embed into ChromaDB
+                # FAISS — no protobuf issues, works everywhere
                 embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-                vectorstore = Chroma.from_documents(chunks, embeddings)
+                vectorstore = FAISS.from_documents(chunks, embeddings)
 
                 st.session_state.retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
                 st.session_state.doc_name = uploaded_file.name
                 st.session_state.chat_history = []
-                st.session_state.page_count = len(pages)
-                st.session_state.chunk_count = len(chunks)
 
                 st.success(f"✅ **{uploaded_file.name}** ready! {len(pages)} pages · {len(chunks)} chunks indexed.")
 
             except Exception as e:
                 st.error(f"❌ Error: {str(e)}")
-                st.info("Make sure your OpenAI API key is correct and has available credits.")
 
 elif uploaded_file and not openai_key:
     st.warning("⚠️ API key not found. Add it in Streamlit Cloud → Settings → Secrets.")
-
 elif not uploaded_file:
     st.info("👆 Upload a PDF above to get started.")
 
@@ -126,7 +115,6 @@ if st.session_state.retriever:
     st.markdown("---")
     st.markdown(f"### 💬 Ask about: `{st.session_state.doc_name}`")
 
-    # Display chat history
     for item in st.session_state.chat_history:
         st.markdown(f"**🧑 You:** {item['question']}")
         st.markdown(f'<div class="answer-box">🤖 <b>DocBot:</b> {item["answer"]}</div>', unsafe_allow_html=True)
@@ -140,11 +128,10 @@ if st.session_state.retriever:
                     st.markdown(f'<div class="source-box">📄 Page {page_num}: "{snippet}..."</div>', unsafe_allow_html=True)
         st.markdown("---")
 
-    # Question input
     with st.form(key="question_form", clear_on_submit=True):
         question = st.text_input(
             "Ask a question:",
-            placeholder="e.g. Summarize this document / What are the main services? / What is the pricing?"
+            placeholder="e.g. Summarize this document / What are the main points?"
         )
         col1, col2 = st.columns([1, 4])
         with col1:
@@ -160,35 +147,24 @@ if st.session_state.retriever:
         with st.spinner("🤔 Thinking..."):
             try:
                 os.environ["OPENAI_API_KEY"] = openai_key
-
-                # Retrieve relevant chunks
                 docs = st.session_state.retriever.invoke(question)
                 context = "\n\n".join([doc.page_content for doc in docs])
 
-                # Build prompt manually
                 system_prompt = """You are a helpful assistant that answers questions strictly based on the provided document context.
 If the answer is not found in the context, say: "I couldn't find this information in the uploaded document."
 Always be concise and clear."""
 
-                user_message = f"""Context from document:
-{context}
+                user_message = f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"
 
-Question: {question}
-
-Answer:"""
-
-                # Call OpenAI directly
                 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-                from langchain_core.messages import SystemMessage, HumanMessage
                 response = llm.invoke([
                     SystemMessage(content=system_prompt),
                     HumanMessage(content=user_message)
                 ])
-                answer = response.content
 
                 st.session_state.chat_history.append({
                     "question": question,
-                    "answer": answer,
+                    "answer": response.content,
                     "sources": docs
                 })
                 st.rerun()
