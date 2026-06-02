@@ -1,18 +1,13 @@
 import streamlit as st
 import tempfile
 import os
+import requests
+import numpy as np
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.vectorstores import FAISS
-from langchain_core.messages import SystemMessage, HumanMessage
 
 # ── Page Config ───────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="DocBot — Ask Your PDF",
-    page_icon="📄",
-    layout="centered"
-)
+st.set_page_config(page_title="DocBot — Ask Your PDF", page_icon="📄", layout="centered")
 
 # ── Custom CSS ────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -42,9 +37,9 @@ with st.sidebar:
     st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/4/4b/PDF_file_icon.svg/267px-PDF_file_icon.svg.png", width=60)
     st.title("DocBot")
     st.markdown("---")
-    openai_key = st.secrets.get("OPENAI_API_KEY", "")
-    if not openai_key:
-        st.error("⚠️ API key not configured.")
+    openrouter_key = st.secrets.get("OPENROUTER_API_KEY", "")
+    if not openrouter_key:
+        st.error("⚠️ OpenRouter API key not configured.")
     else:
         st.success("✅ API Key loaded")
     st.markdown("---")
@@ -57,61 +52,115 @@ with st.sidebar:
 st.title("📄 DocBot — Ask Your PDF")
 st.markdown("Upload any PDF and ask questions. The AI answers **only from your document**.")
 
-uploaded_file = st.file_uploader(
-    "📂 Upload a PDF file",
-    type=["pdf"],
-    help="Supports any PDF: contracts, manuals, reports, brochures, resumes"
-)
+uploaded_file = st.file_uploader("📂 Upload a PDF file", type=["pdf"])
 
 # ── Session State ─────────────────────────────────────────────────────────────
-if "retriever" not in st.session_state:
-    st.session_state.retriever = None
+if "chunks" not in st.session_state:
+    st.session_state.chunks = None
+if "embeddings_matrix" not in st.session_state:
+    st.session_state.embeddings_matrix = None
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "doc_name" not in st.session_state:
     st.session_state.doc_name = None
 
-# ── Process PDF ───────────────────────────────────────────────────────────────
-if uploaded_file and openai_key:
-    if st.session_state.doc_name != uploaded_file.name:
-        with st.spinner("📖 Reading and indexing your document... (~15 seconds)"):
-            try:
-                os.environ["OPENAI_API_KEY"] = openai_key
+# ── Helper: Get Embeddings via OpenRouter ─────────────────────────────────────
+def get_embeddings(texts, api_key):
+    response = requests.post(
+        url="https://openrouter.ai/api/v1/embeddings",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://docbot.streamlit.app",
+            "X-Title": "DocBot"
+        },
+        json={"model": "text-embedding-3-small", "input": texts},
+        timeout=60
+    )
+    result = response.json()
+    if "data" in result:
+        return [item["embedding"] for item in result["data"]]
+    raise Exception(f"Embedding error: {result}")
 
+# ── Helper: Find Relevant Chunks ──────────────────────────────────────────────
+def cosine_similarity(a, b):
+    a, b = np.array(a), np.array(b)
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+def find_relevant_chunks(query_emb, embeddings, chunks, top_k=4):
+    sims = [cosine_similarity(query_emb, e) for e in embeddings]
+    top_idx = np.argsort(sims)[-top_k:][::-1]
+    return [chunks[i] for i in top_idx]
+
+# ── Helper: Ask OpenRouter (gpt-oss-120b free model) ─────────────────────────
+def ask_openrouter(context, question, api_key):
+    response = requests.post(
+        url="https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://docbot.streamlit.app",
+            "X-Title": "DocBot"
+        },
+        json={
+            "model": "openai/gpt-4o-mini:free",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant that answers questions strictly based on the provided document context. If the answer is not found in the context, say: 'I couldn't find this information in the uploaded document.' Always be concise and clear."
+                },
+                {
+                    "role": "user",
+                    "content": f"Context from document:\n{context}\n\nQuestion: {question}\n\nAnswer:"
+                }
+            ]
+        },
+        timeout=60
+    )
+    result = response.json()
+    if "choices" in result:
+        return result["choices"][0]["message"]["content"]
+    raise Exception(f"Chat error: {result}")
+
+# ── Process PDF ───────────────────────────────────────────────────────────────
+if uploaded_file and openrouter_key:
+    if st.session_state.doc_name != uploaded_file.name:
+        with st.spinner("📖 Reading and indexing your document..."):
+            try:
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
                     f.write(uploaded_file.read())
                     tmp_path = f.name
 
-                loader = PyPDFLoader(tmp_path)
-                pages = loader.load()
-
-                splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=600,
-                    chunk_overlap=80,
-                    separators=["\n\n", "\n", ".", " "]
-                )
+                pages = PyPDFLoader(tmp_path).load()
+                splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=80)
                 chunks = splitter.split_documents(pages)
+                chunk_texts = [c.page_content for c in chunks]
 
-                # FAISS — no protobuf issues, works everywhere
-                embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-                vectorstore = FAISS.from_documents(chunks, embeddings)
+                # Embed in batches of 20
+                all_embeddings = []
+                batch_size = 20
+                bar = st.progress(0, text="Embedding document...")
+                for i in range(0, len(chunk_texts), batch_size):
+                    batch = chunk_texts[i:i+batch_size]
+                    all_embeddings.extend(get_embeddings(batch, openrouter_key))
+                    bar.progress(min((i+batch_size)/len(chunk_texts), 1.0), text=f"Embedding... {min(i+batch_size, len(chunk_texts))}/{len(chunk_texts)}")
 
-                st.session_state.retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+                st.session_state.chunks = chunks
+                st.session_state.embeddings_matrix = all_embeddings
                 st.session_state.doc_name = uploaded_file.name
                 st.session_state.chat_history = []
-
                 st.success(f"✅ **{uploaded_file.name}** ready! {len(pages)} pages · {len(chunks)} chunks indexed.")
 
             except Exception as e:
                 st.error(f"❌ Error: {str(e)}")
 
-elif uploaded_file and not openai_key:
-    st.warning("⚠️ API key not found. Add it in Streamlit Cloud → Settings → Secrets.")
-elif not uploaded_file:
+elif uploaded_file and not openrouter_key:
+    st.warning("⚠️ Add OPENROUTER_API_KEY in Streamlit Cloud → Settings → Secrets.")
+else:
     st.info("👆 Upload a PDF above to get started.")
 
 # ── Chat Interface ────────────────────────────────────────────────────────────
-if st.session_state.retriever:
+if st.session_state.chunks and st.session_state.embeddings_matrix:
     st.markdown("---")
     st.markdown(f"### 💬 Ask about: `{st.session_state.doc_name}`")
 
@@ -122,17 +171,13 @@ if st.session_state.retriever:
             with st.expander("📎 Source pages used"):
                 for src in item["sources"]:
                     page_num = src.metadata.get("page", "?")
-                    if isinstance(page_num, int):
-                        page_num += 1
+                    if isinstance(page_num, int): page_num += 1
                     snippet = src.page_content[:250].replace("\n", " ")
                     st.markdown(f'<div class="source-box">📄 Page {page_num}: "{snippet}..."</div>', unsafe_allow_html=True)
         st.markdown("---")
 
     with st.form(key="question_form", clear_on_submit=True):
-        question = st.text_input(
-            "Ask a question:",
-            placeholder="e.g. Summarize this document / What are the main points?"
-        )
+        question = st.text_input("Ask a question:", placeholder="e.g. Summarize this document / What are the main points?")
         col1, col2 = st.columns([1, 4])
         with col1:
             submit = st.form_submit_button("Ask →", use_container_width=True)
@@ -146,28 +191,11 @@ if st.session_state.retriever:
     if submit and question:
         with st.spinner("🤔 Thinking..."):
             try:
-                os.environ["OPENAI_API_KEY"] = openai_key
-                docs = st.session_state.retriever.invoke(question)
-                context = "\n\n".join([doc.page_content for doc in docs])
-
-                system_prompt = """You are a helpful assistant that answers questions strictly based on the provided document context.
-If the answer is not found in the context, say: "I couldn't find this information in the uploaded document."
-Always be concise and clear."""
-
-                user_message = f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"
-
-                llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-                response = llm.invoke([
-                    SystemMessage(content=system_prompt),
-                    HumanMessage(content=user_message)
-                ])
-
-                st.session_state.chat_history.append({
-                    "question": question,
-                    "answer": response.content,
-                    "sources": docs
-                })
+                query_emb = get_embeddings([question], openrouter_key)[0]
+                relevant = find_relevant_chunks(query_emb, st.session_state.embeddings_matrix, st.session_state.chunks)
+                context = "\n\n".join([c.page_content for c in relevant])
+                answer = ask_openrouter(context, question, openrouter_key)
+                st.session_state.chat_history.append({"question": question, "answer": answer, "sources": relevant})
                 st.rerun()
-
             except Exception as e:
                 st.error(f"Error: {str(e)}")
