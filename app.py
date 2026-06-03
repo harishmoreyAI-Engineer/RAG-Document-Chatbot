@@ -165,8 +165,8 @@ if st.session_state.chunks:
 
     for item in st.session_state.chat_history:
         st.markdown(f"**🧑 You:** {item['question']}")
-        model_used = item.get('model_used', '')
-        st.markdown(f'<div class="answer-box">🤖 <b>DocBot:</b> {item["answer"]}<br><small style="color:#94a3b8">Model: {model_used}</small></div>', unsafe_allow_html=True)
+
+        st.markdown(f'<div class="answer-box">🤖 <b>DocBot:</b> {item["answer"]}</div>', unsafe_allow_html=True)
         if item.get("sources"):
             with st.expander("📎 Source pages used"):
                 for src in item["sources"]:
@@ -200,13 +200,12 @@ if st.session_state.chunks:
                 context = "\n\n".join([c.page_content for c in relevant])
 
                 # Get AI answer with auto-fallback
-                answer, model_used = ask_openrouter(context, question, openrouter_key)
+                answer, _ = ask_openrouter(context, question, openrouter_key)
 
                 st.session_state.chat_history.append({
                     "question": question,
                     "answer": answer,
                     "sources": relevant,
-                    "model_used": model_used
                 })
                 st.rerun()
 
