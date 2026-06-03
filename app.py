@@ -64,63 +64,69 @@ if "chat_history" not in st.session_state:
 if "doc_name" not in st.session_state:
     st.session_state.doc_name = None
 
-# ── Helper: Get Embeddings via OpenRouter ─────────────────────────────────────
-def get_embeddings(texts, api_key):
-    response = requests.post(
-        url="https://openrouter.ai/api/v1/embeddings",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://docbot.streamlit.app",
-            "X-Title": "DocBot"
-        },
-        json={"model": "text-embedding-3-small", "input": texts},
-        timeout=60
-    )
-    result = response.json()
-    if "data" in result:
-        return [item["embedding"] for item in result["data"]]
-    raise Exception(f"Embedding error: {result}")
+# ── Helper: Simple TF-IDF style keyword search (no API needed for embeddings) ─
+def simple_search(query, chunks, top_k=4):
+    """
+    Simple keyword overlap search — works without any embedding API.
+    Scores each chunk by how many query words appear in it.
+    """
+    query_words = set(query.lower().split())
+    scores = []
+    for chunk in chunks:
+        text = chunk.page_content.lower()
+        score = sum(1 for word in query_words if word in text)
+        scores.append(score)
+    top_indices = np.argsort(scores)[-top_k:][::-1]
+    return [chunks[i] for i in top_indices]
 
-# ── Helper: Find Relevant Chunks ──────────────────────────────────────────────
-def cosine_similarity(a, b):
-    a, b = np.array(a), np.array(b)
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
-
-def find_relevant_chunks(query_emb, embeddings, chunks, top_k=4):
-    sims = [cosine_similarity(query_emb, e) for e in embeddings]
-    top_idx = np.argsort(sims)[-top_k:][::-1]
-    return [chunks[i] for i in top_idx]
-
-# ── Helper: Ask OpenRouter (gpt-oss-120b free model) ─────────────────────────
+# ── Helper: Ask OpenRouter ────────────────────────────────────────────────────
 def ask_openrouter(context, question, api_key):
-    response = requests.post(
-        url="https://openrouter.ai/api/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://docbot.streamlit.app",
-            "X-Title": "DocBot"
-        },
-        json={
-            "model": "openai/gpt-4o-mini:free",
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You are a helpful assistant that answers questions strictly based on the provided document context. If the answer is not found in the context, say: 'I couldn't find this information in the uploaded document.' Always be concise and clear."
+    """
+    Uses openrouter/free — automatically picks the best available free model.
+    Falls back to deepseek and llama if needed.
+    """
+    models_to_try = [
+        "openrouter/free",
+        "deepseek/deepseek-r1:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "mistralai/mistral-7b-instruct:free",
+    ]
+
+    last_error = None
+    for model in models_to_try:
+        try:
+            response = requests.post(
+                url="https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://docbot.streamlit.app",
+                    "X-Title": "DocBot"
                 },
-                {
-                    "role": "user",
-                    "content": f"Context from document:\n{context}\n\nQuestion: {question}\n\nAnswer:"
-                }
-            ]
-        },
-        timeout=60
-    )
-    result = response.json()
-    if "choices" in result:
-        return result["choices"][0]["message"]["content"]
-    raise Exception(f"Chat error: {result}")
+                json={
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a helpful assistant that answers questions strictly based on the provided document context. If the answer is not found in the context, say: 'I couldn't find this information in the uploaded document.' Always be concise and clear."
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Context from document:\n{context}\n\nQuestion: {question}\n\nAnswer:"
+                        }
+                    ]
+                },
+                timeout=60
+            )
+            result = response.json()
+            if "choices" in result:
+                return result["choices"][0]["message"]["content"], model
+            last_error = result
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    raise Exception(f"All models failed. Last error: {last_error}")
 
 # ── Process PDF ───────────────────────────────────────────────────────────────
 if uploaded_file and openrouter_key:
@@ -132,23 +138,16 @@ if uploaded_file and openrouter_key:
                     tmp_path = f.name
 
                 pages = PyPDFLoader(tmp_path).load()
-                splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=80)
+                splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=600,
+                    chunk_overlap=80
+                )
                 chunks = splitter.split_documents(pages)
-                chunk_texts = [c.page_content for c in chunks]
-
-                # Embed in batches of 20
-                all_embeddings = []
-                batch_size = 20
-                bar = st.progress(0, text="Embedding document...")
-                for i in range(0, len(chunk_texts), batch_size):
-                    batch = chunk_texts[i:i+batch_size]
-                    all_embeddings.extend(get_embeddings(batch, openrouter_key))
-                    bar.progress(min((i+batch_size)/len(chunk_texts), 1.0), text=f"Embedding... {min(i+batch_size, len(chunk_texts))}/{len(chunk_texts)}")
 
                 st.session_state.chunks = chunks
-                st.session_state.embeddings_matrix = all_embeddings
                 st.session_state.doc_name = uploaded_file.name
                 st.session_state.chat_history = []
+
                 st.success(f"✅ **{uploaded_file.name}** ready! {len(pages)} pages · {len(chunks)} chunks indexed.")
 
             except Exception as e:
@@ -160,24 +159,29 @@ else:
     st.info("👆 Upload a PDF above to get started.")
 
 # ── Chat Interface ────────────────────────────────────────────────────────────
-if st.session_state.chunks and st.session_state.embeddings_matrix:
+if st.session_state.chunks:
     st.markdown("---")
     st.markdown(f"### 💬 Ask about: `{st.session_state.doc_name}`")
 
     for item in st.session_state.chat_history:
         st.markdown(f"**🧑 You:** {item['question']}")
-        st.markdown(f'<div class="answer-box">🤖 <b>DocBot:</b> {item["answer"]}</div>', unsafe_allow_html=True)
+        model_used = item.get('model_used', '')
+        st.markdown(f'<div class="answer-box">🤖 <b>DocBot:</b> {item["answer"]}<br><small style="color:#94a3b8">Model: {model_used}</small></div>', unsafe_allow_html=True)
         if item.get("sources"):
             with st.expander("📎 Source pages used"):
                 for src in item["sources"]:
                     page_num = src.metadata.get("page", "?")
-                    if isinstance(page_num, int): page_num += 1
+                    if isinstance(page_num, int):
+                        page_num += 1
                     snippet = src.page_content[:250].replace("\n", " ")
                     st.markdown(f'<div class="source-box">📄 Page {page_num}: "{snippet}..."</div>', unsafe_allow_html=True)
         st.markdown("---")
 
     with st.form(key="question_form", clear_on_submit=True):
-        question = st.text_input("Ask a question:", placeholder="e.g. Summarize this document / What are the main points?")
+        question = st.text_input(
+            "Ask a question:",
+            placeholder="e.g. Summarize this document / What are the main points?"
+        )
         col1, col2 = st.columns([1, 4])
         with col1:
             submit = st.form_submit_button("Ask →", use_container_width=True)
@@ -191,11 +195,20 @@ if st.session_state.chunks and st.session_state.embeddings_matrix:
     if submit and question:
         with st.spinner("🤔 Thinking..."):
             try:
-                query_emb = get_embeddings([question], openrouter_key)[0]
-                relevant = find_relevant_chunks(query_emb, st.session_state.embeddings_matrix, st.session_state.chunks)
+                # Find relevant chunks using keyword search (no API cost)
+                relevant = simple_search(question, st.session_state.chunks)
                 context = "\n\n".join([c.page_content for c in relevant])
-                answer = ask_openrouter(context, question, openrouter_key)
-                st.session_state.chat_history.append({"question": question, "answer": answer, "sources": relevant})
+
+                # Get AI answer with auto-fallback
+                answer, model_used = ask_openrouter(context, question, openrouter_key)
+
+                st.session_state.chat_history.append({
+                    "question": question,
+                    "answer": answer,
+                    "sources": relevant,
+                    "model_used": model_used
+                })
                 st.rerun()
+
             except Exception as e:
                 st.error(f"Error: {str(e)}")
